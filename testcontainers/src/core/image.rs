@@ -1,4 +1,6 @@
 use std::{collections::BTreeMap, env::var, fmt::Debug, time::Duration};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use super::ports::Ports;
 
@@ -304,6 +306,18 @@ impl<I: Image> From<(I, I::Args)> for RunnableImage<I> {
             privileged: false,
             shm_size: None,
         }
+    }
+}
+
+impl<I: Image> Hash for RunnableImage<I> {
+    fn hash<H: Hasher>(&self, state:  &mut H) {
+        self.image.name().hash(state);
+        self.image.tag().hash(state);
+        self.network.as_ref().map(|network| network.hash(state));
+        self.ports.as_ref().map(|ports| ports.iter().for_each(|port| port.internal.hash(state)));
+        self.container_name.as_ref().map(|container_name| container_name.hash(state));
+        self.env_vars.iter().for_each(|(key, value)| {key.hash(state); value.hash(state)});
+        self.volumes.iter().for_each(|(key, value)| {key.hash(state); value.hash(state)});
     }
 }
 

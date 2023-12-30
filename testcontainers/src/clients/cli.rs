@@ -11,9 +11,12 @@ use std::{
     thread::sleep,
     time::{Duration, Instant},
 };
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 const ONE_SECOND: Duration = Duration::from_secs(1);
 const ZERO: Duration = Duration::from_secs(0);
+const HASH_LABEL: &'static str = "org.testcontainers.hash";
 
 /// Implementation of the Docker client API using the docker cli.
 ///
@@ -38,36 +41,60 @@ impl Cli {
                 guard.push(network.to_owned());
             }
         }
-
-        let mut command = Client::build_run_command(&image, self.inner.command());
-
-        log::debug!("Executing command: {:?}", command);
-
-        let output = command.output().expect("Failed to execute docker command");
-        if !output.status.success() {
-            let stdout = std::str::from_utf8(&output.stdout).unwrap_or("{not utf8}");
-            let stderr = std::str::from_utf8(&output.stderr).unwrap_or("{not utf8}");
-            log::error!("Failed to start container.\nContainer stdout: {stdout}\nContainer stderr: {stderr}");
-            panic!("Failed to start container, check log for details")
+        let mut hasher = DefaultHasher::default();
+        image.hash(&mut hasher);
+        let hash = hasher.finish();
+        let mut container_id = String::new();
+        if self.inner.reuse {
+            let mut command = Client::build_find_command(self.inner.command(), hash);
+            log::debug!("Executing command: {:?}", command);
+            let output = command.output().expect("Failed to execute docker command");
+            if !output.status.success() {
+                let stdout = std::str::from_utf8(&output.stdout).unwrap_or("{not utf8}");
+                let stderr = std::str::from_utf8(&output.stderr).unwrap_or("{not utf8}");
+                log::error!("Failed to start container.\nContainer stdout: {stdout}\nContainer stderr: {stderr}");
+                panic!("Failed to start container, check log for details")
+            }
+            log::debug!("Output was: {:?}", output.stdout);
+            container_id = String::from_utf8(output.stdout)
+                .expect("output is not valid utf8")
+                .replace('"', "")
+                .trim()
+                .to_string();
         }
+        if container_id.is_empty() {
+            let mut command = Client::build_run_command(&image, self.inner.command(), hash);
 
-        let container_id = String::from_utf8(output.stdout)
-            .expect("output is not valid utf8")
-            .trim()
-            .to_string();
+            log::debug!("Executing command: {:?}", command);
 
-        #[cfg(feature = "watchdog")]
-        if self.inner.command == env::Command::Remove {
-            crate::watchdog::register(container_id.clone());
+            let output = command.output().expect("Failed to execute docker command");
+            if !output.status.success() {
+                let stdout = std::str::from_utf8(&output.stdout).unwrap_or("{not utf8}");
+                let stderr = std::str::from_utf8(&output.stderr).unwrap_or("{not utf8}");
+                log::error!("Failed to start container.\nContainer stdout: {stdout}\nContainer stderr: {stderr}");
+                panic!("Failed to start container, check log for details")
+            }
+
+            container_id = String::from_utf8(output.stdout)
+                .expect("output is not valid utf8")
+                .trim()
+                .to_string();
+            #[cfg(feature = "watchdog")]
+            if self.inner.command == env::Command::Remove {
+                crate::watchdog::register(container_id.clone());
+            }
+
+            self.inner.register_container_started(container_id.clone());
+
+            self.block_until_ready(&container_id, image.ready_conditions());
+        } else {
+            log::debug!("Reusing container with id: {}", container_id);
         }
-
-        self.inner.register_container_started(container_id.clone());
-
-        self.block_until_ready(&container_id, image.ready_conditions());
 
         let client = Cli {
             inner: self.inner.clone(),
         };
+
 
         let container = Container::new(container_id, client, image, self.inner.command);
 
@@ -95,6 +122,7 @@ struct Client {
     created_networks: RwLock<Vec<String>>,
     binary: OsString,
     command: env::Command,
+    reuse: bool,
 }
 
 impl Client {
@@ -145,8 +173,11 @@ impl Client {
         }
     }
 
-    fn build_run_command<I: Image>(image: &RunnableImage<I>, mut command: Command) -> Command {
+    fn build_run_command<I: Image>(image: &RunnableImage<I>, mut command: Command, container_hash: u64) -> Command {
         command.arg("run");
+
+        command.arg("--label");
+        command.arg(format!("{}={}", HASH_LABEL, container_hash));
 
         if image.privileged() {
             command.arg("--privileged");
@@ -200,6 +231,20 @@ impl Client {
             .args(image.args().clone().into_iterator())
             .stdout(Stdio::piped());
 
+        command
+    }
+
+    fn build_find_command(mut command: Command, container_hash: u64) -> Command {
+        command.arg("ps");
+        command.arg("--no-trunc");
+        command.arg("--format");
+        command.arg("\"{{.ID}}\"");
+        command.arg("--filter");
+        command.arg("status=running");
+        command.arg("--filter");
+        command.arg(format!("label={}={}", HASH_LABEL, container_hash));
+
+        command.stdout(Stdio::piped());
         command
     }
 
@@ -263,6 +308,18 @@ impl Cli {
                 created_networks: Default::default(),
                 binary: "docker".into(),
                 command: env::command::<E>().unwrap_or_default(),
+                reuse: false,
+            }),
+        }
+    }
+    pub fn with_reuse() -> Self {
+        Self {
+            inner: Arc::new(Client {
+                container_startup_timestamps: Default::default(),
+                created_networks: Default::default(),
+                binary: "docker".into(),
+                command: env::Command::Keep,
+                reuse: true,
             }),
         }
     }
@@ -518,13 +575,13 @@ mod tests {
         let image = HelloWorld { volumes, env_vars };
 
         let command =
-            Client::build_run_command(&RunnableImage::from(image), Command::new("docker"));
+            Client::build_run_command(&RunnableImage::from(image), Command::new("docker"), 0);
 
         println!("Executing command: {command:?}");
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "-e" "one-key=one-value" "-e" "two-key=two-value" "-v" "one-from:one-dest" "-v" "two-from:two-dest" "-P" "-d" "hello-world:latest""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "-e" "one-key=one-value" "-e" "two-key=two-value" "-v" "one-from:one-dest" "-v" "two-from:two-dest" "-P" "-d" "hello-world:latest""#
         );
     }
 
@@ -533,11 +590,11 @@ mod tests {
         let image = GenericImage::new("hello", "0.0");
 
         let command =
-            Client::build_run_command(&RunnableImage::from(image), Command::new("docker"));
+            Client::build_run_command(&RunnableImage::from(image), Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "-P" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "-P" "-d" "hello:0.0""#
         );
     }
 
@@ -548,11 +605,11 @@ mod tests {
         let image = RunnableImage::from(image)
             .with_mapped_port((123, 456))
             .with_mapped_port((555, 888));
-        let command = Client::build_run_command(&image, Command::new("docker"));
+        let command = Client::build_run_command(&image, Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "-p" "123:456" "-p" "555:888" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "-p" "123:456" "-p" "555:888" "-d" "hello:0.0""#
         );
     }
 
@@ -569,11 +626,11 @@ mod tests {
         let image = GenericImage::new("hello", "0.0");
 
         let image = RunnableImage::from(image).with_network("awesome-net");
-        let command = Client::build_run_command(&image, Command::new("docker"));
+        let command = Client::build_run_command(&image, Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "--network=awesome-net" "-P" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "--network=awesome-net" "-P" "-d" "hello:0.0""#
         );
     }
 
@@ -581,11 +638,11 @@ mod tests {
     fn cli_run_command_should_include_name() {
         let image = GenericImage::new("hello", "0.0");
         let image = RunnableImage::from(image).with_container_name("hello_container");
-        let command = Client::build_run_command(&image, Command::new("docker"));
+        let command = Client::build_run_command(&image, Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "--name=hello_container" "-P" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "--name=hello_container" "-P" "-d" "hello:0.0""#
         );
     }
 
@@ -595,11 +652,11 @@ mod tests {
         let image = RunnableImage::from(image)
             .with_container_name("hello_container")
             .with_network("container:the_other_one");
-        let command = Client::build_run_command(&image, Command::new("docker"));
+        let command = Client::build_run_command(&image, Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "--network=container:the_other_one" "--name=hello_container" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "--network=container:the_other_one" "--name=hello_container" "-d" "hello:0.0""#
         );
     }
 
@@ -607,11 +664,11 @@ mod tests {
     fn cli_run_command_should_include_privileged() {
         let image = GenericImage::new("hello", "0.0");
         let image = RunnableImage::from(image).with_privileged(true);
-        let command = Client::build_run_command(&image, Command::new("docker"));
+        let command = Client::build_run_command(&image, Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "--privileged" "-P" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "--privileged" "-P" "-d" "hello:0.0""#
         );
     }
 
@@ -619,11 +676,11 @@ mod tests {
     fn cli_run_command_should_include_shm_size() {
         let image = GenericImage::new("hello", "0.0");
         let image = RunnableImage::from(image).with_shm_size(1_000_000);
-        let command = Client::build_run_command(&image, Command::new("docker"));
+        let command = Client::build_run_command(&image, Command::new("docker"), 0);
 
         assert_eq!(
             format!("{command:?}"),
-            r#""docker" "run" "--shm-size=1000000" "-P" "-d" "hello:0.0""#
+            r#""docker" "run" "--label" "org.testcontainers.hash=0" "--shm-size=1000000" "-P" "-d" "hello:0.0""#
         );
     }
 
@@ -686,6 +743,34 @@ mod tests {
         );
 
         docker.inner.delete_networks(vec![network_name]);
+    }
+
+    #[test]
+    fn should_not_delete_container_and_reuse_it_if_cli_is_create_with_reuse() {
+
+        let container1 = {
+            let docker = Cli::with_reuse();
+            let msg = WaitFor::message_on_stdout("server is ready");
+            let image = GenericImage::new("simple_web_server", "latest").with_wait_for(msg.clone());
+            let container1 = docker.run(image);
+            container1.id().to_string()
+        };
+        let container2 = {
+            let docker = Cli::with_reuse();
+            let msg = WaitFor::message_on_stdout("server is ready");
+            let image = GenericImage::new("simple_web_server", "latest").with_wait_for(msg.clone());
+            let container2 = docker.run(image);
+            container2.id().to_string()
+        };
+
+        let docker = Cli::default();
+
+        docker.rm(container1.as_str());
+        if container1.ne(&container2) {
+            docker.rm(container2.as_str());
+        }
+        assert_eq!(container1, container2);
+
     }
 
     #[test]
